@@ -228,7 +228,7 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         # needed for a locally hosted reception frontend, not for LAN access.
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
-        self.end_headers()
+        super().end_headers()
 
     def do_OPTIONS(self) -> None:  # noqa: N802
         self.send_response(HTTPStatus.NO_CONTENT)
