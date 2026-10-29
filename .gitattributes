@@ -1,0 +1,2 @@
+# Windows batch files must keep CRLF in the repository and in every checkout or archive.
+*.cmd -text

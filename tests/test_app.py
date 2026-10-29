@@ -52,7 +52,14 @@ class AgentHttpServerTest(unittest.TestCase):
 
             self.assertEqual(response.status, 200)
             self.assertEqual(response.getheader("Access-Control-Allow-Origin"), "*")
-            self.assertEqual(json.loads(response.read()), {"status": "ok"})
+            # Was {"status": "ok"}; the device state was added for diagnostics at the reception.
+            self.assertEqual(
+                json.loads(response.read()),
+                {
+                    "status": "ok",
+                    "device": {"state": "starting", "lastPacketAt": None, "reconnects": 0, "lastError": None},
+                },
+            )
         finally:
             connection.close()
 
