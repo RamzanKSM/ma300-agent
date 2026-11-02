@@ -8,6 +8,7 @@ creates attendance records in the main application.
 
 from __future__ import annotations
 
+import collections
 import errno
 import json
 import locale
@@ -27,6 +28,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from struct import unpack
 from typing import Any, Callable, Iterator, List, MutableMapping, Optional
+from urllib.parse import parse_qs, urlsplit
 
 
 LOG = logging.getLogger("ma300_agent")
@@ -49,6 +51,8 @@ CMD_ACK_UNAUTH = 2005
 EF_ATTLOG = 1
 EF_FPFTR = 256  # fingerprint minutiae: bulky and of no use here
 EF_HIDNUM = 4096  # zkemkeeper's OnHIDNum mask: a card was presented, enrolled or not. Not yet seen on a real MA300.
+LOG_PAGE_LINES = 2000
+LOG_PAGE_HOSTS = {"127.0.0.1", "localhost", "::1"}
 EVENT_MASK = 0xFFFF & ~EF_FPFTR
 CARD_REPEAT_SECONDS = 3.0
 USHRT_MAX = 65535
@@ -223,6 +227,34 @@ class DeviceAttendanceEvent:
         }
 
 
+class LogBuffer(logging.Handler):
+    """The last log lines for the /logs page."""
+
+    def __init__(self, capacity: int = LOG_PAGE_LINES) -> None:
+        super().__init__()
+        self._lines: collections.deque[tuple[int, str]] = collections.deque(maxlen=capacity)
+        self._sequence = 0
+        self._guard = threading.Lock()
+
+    def add(self, line: str) -> None:
+        with self._guard:
+            self._sequence += 1
+            self._lines.append((self._sequence, line))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.add(self.format(record))
+        except Exception:  # a log line must never break the agent.
+            self.handleError(record)
+
+    def after(self, sequence: int) -> List[dict[str, Any]]:
+        with self._guard:
+            return [{"seq": number, "text": line} for number, line in self._lines if number > sequence]
+
+
+LOG_BUFFER = LogBuffer()
+
+
 class EventHub:
     """Fan-out hub for browser SSE connections."""
 
@@ -338,9 +370,7 @@ class ZkLiveCaptureSource:
         self._settings = settings
         self.status = status or DeviceStatus()
         self._monotonic = monotonic
-        self._cards: dict[str, str] = {}
         self._last_card: Optional[tuple[str, float]] = None
-        self._pending: List[Any] = []
 
     def events(self, stopped: threading.Event) -> Iterator[DeviceAttendanceEvent]:
         timeout = self._settings.device_timeout_seconds
@@ -359,7 +389,6 @@ class ZkLiveCaptureSource:
                     self._settings.device_host,
                     self._settings.device_port,
                 )
-                self._read_cards(connection)
                 capture = self._capture(connection, timeout)
                 last_packet = self._monotonic()
                 try:
@@ -444,8 +473,7 @@ class ZkLiveCaptureSource:
             packet = getattr(connection, "_ZK__data_recv")
             getattr(connection, "_ZK__ack_ok")()
             LOG.debug("MA300 pushed an event during the session check")
-            # The clock reply is still on its way, so no command here: _capture() resolves the card after it.
-            return self._decode_event(connection, unpack("<4H", packet[:8])[2], packet[8:], resolve=False)
+            return self._decode_event(connection, unpack("<4H", packet[:8])[2], packet[8:])
         if code == CMD_ACK_UNAUTH:
             raise SessionLost("terminal answered 'unauthorized': it forgot the session")
         # Any other answer still comes from a terminal that serves the session;
@@ -454,7 +482,7 @@ class ZkLiveCaptureSource:
         return []
 
     def _capture(self, connection: Any, timeout: float) -> Iterator[Optional[List[Any]]]:
-        """Like pyzk live_capture(), which hears only EF_ATTLOG: an unknown card never gets there."""
+        """Like pyzk live_capture(), which hears only EF_ATTLOG: an attendance has no card number in it."""
         connection.cancel_capture()
         connection.verify_user()
         if not connection.is_enabled:
@@ -462,54 +490,38 @@ class ZkLiveCaptureSource:
         try:
             connection.reg_event(EVENT_MASK)
         except Exception as error:  # some firmware may refuse the wide mask.
-            LOG.warning("MA300 refused the event mask (%s); only enrolled cards will be seen", error)
-            connection.reg_event(EF_ATTLOG)
+            LOG.warning("MA300 refused the event mask %#x (%s); asking for cards only", EVENT_MASK, error)
+            connection.reg_event(EF_HIDNUM)
         sock = getattr(connection, "_ZK__sock")
         sock.settimeout(timeout)
         while True:
             try:
                 packet = sock.recv(1032)
             except socket.timeout:
-                yield self._resolve_pending(connection) if self._pending else None
+                yield None
                 continue
             getattr(connection, "_ZK__ack_ok")()
             if connection.tcp:
                 packet = packet[8:]
             command, _checksum, code, _reply = unpack("<4H", packet[:8])
-            yield self._decode_event(connection, code, packet[8:]) if command == CMD_REG_EVENT else self._resolve_pending(connection)
+            yield self._decode_event(connection, code, packet[8:]) if command == CMD_REG_EVENT else []
 
-    def _decode_event(self, connection: Any, code: int, data: bytes, resolve: bool = True) -> List[Any]:
-        """The cards behind one CMD_REG_EVENT packet; `user_id` of a read is the card number."""
-        if code == EF_ATTLOG:
-            self._pending.extend(parse_reg_event(data, getattr(connection, "_ZK__decode_timehex")))
-            return self._resolve_pending(connection) if resolve else []
+    def _decode_event(self, connection: Any, code: int, data: bytes) -> List[Any]:
+        """The cards in one CMD_REG_EVENT packet; `user_id` of a read is the card number."""
         # Kept at INFO on purpose: this is the evidence of what the terminal really sends.
         LOG.info("MA300 event code=%s data=%s", code, data.hex())
+        if code == EF_ATTLOG:
+            for attendance in parse_reg_event(data, getattr(connection, "_ZK__decode_timehex")):
+                LOG.info("MA300 attendance of terminal user %s: no card number in it, not a card read", attendance.user_id)
+            return []
         if code == EF_HIDNUM and len(data) >= 4:
             number = unpack("<I", data[:4])[0]
             if number:
                 return [_RegEventAttendance(str(number), None, 0, 0)]
         return []
 
-    def _resolve_pending(self, connection: Any) -> List[Any]:
-        if any(attendance.user_id not in self._cards for attendance in self._pending):
-            # Enrolled on the terminal after the agent connected.
-            self._read_cards(connection)
-        reads = []
-        for attendance in self._pending:
-            card = self._cards.get(attendance.user_id)
-            if card is None:
-                LOG.warning("MA300 user %s has no card number; event skipped", attendance.user_id)
-                continue
-            reads.append(_RegEventAttendance(card, attendance.timestamp, attendance.status, attendance.punch))
-        self._pending = []
-        return reads
-
-    def _read_cards(self, connection: Any) -> None:
-        self._cards = {str(user.user_id): str(user.card) for user in connection.get_users() if user.card}
-
     def _convert(self, attendance: Any) -> Optional[DeviceAttendanceEvent]:
-        # One touch of an enrolled card can arrive twice: as the card and as the attendance.
+        # A card held at the terminal is read again and again; that is one touch.
         now = self._monotonic()
         card = str(attendance.user_id)
         last = self._last_card
@@ -596,6 +608,53 @@ def address_in_use(error: OSError) -> bool:
     return error.errno == errno.EADDRINUSE
 
 
+LOG_PAGE = """<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><title>Логи MA300</title>
+<style>
+body{margin:0;background:#16181c;color:#d8dade;font:13px/1.45 Consolas,Menlo,monospace}
+header{position:sticky;top:0;display:flex;flex-wrap:wrap;gap:16px;align-items:center;padding:10px 16px;background:#22252b;border-bottom:1px solid #383c44;font-family:Segoe UI,Arial,sans-serif}
+#state{font-weight:600}.ok{color:#6fcf8b}.bad{color:#f0816f}
+input[type=search]{padding:4px 8px;background:#16181c;color:inherit;border:1px solid #484d57;border-radius:4px;min-width:220px}
+main{padding:10px 16px;white-space:pre-wrap;word-break:break-all}
+.WARNING{color:#e8c267}.ERROR,.CRITICAL{color:#f0816f}.card{color:#7cc4f5}
+</style></head><body>
+<header><span>Терминал: <span id="state">…</span></span><span id="detail"></span>
+<input id="filter" type="search" placeholder="Найти в логах" aria-label="Найти в логах">
+<label><input id="follow" type="checkbox" checked> Прокручивать вниз</label></header>
+<main id="log"></main>
+<script>
+var after = 0, box = document.getElementById("log"), filter = document.getElementById("filter");
+var names = {connected: "подключён", connecting: "подключаюсь", reconnecting: "нет связи, переподключаюсь", starting: "запуск"};
+function matches(row) { return row.textContent.toLowerCase().indexOf(filter.value.toLowerCase()) >= 0; }
+filter.oninput = function () { for (var i = 0; i < box.children.length; i++) box.children[i].hidden = !matches(box.children[i]); };
+function show(data) {
+  var state = document.getElementById("state");
+  state.textContent = names[data.device.state] || data.device.state;
+  state.className = data.device.state === "connected" ? "ok" : "bad";
+  document.getElementById("detail").textContent = data.device.lastError || "";
+  data.lines.forEach(function (line) {
+    var row = document.createElement("div"), level = /^\\S+ \\S+ (WARNING|ERROR|CRITICAL) /.exec(line.text);
+    row.textContent = line.text;
+    row.className = level ? level[1] : line.text.indexOf("EVENT:") >= 0 ? "card" : "";
+    row.hidden = !matches(row);
+    box.appendChild(row);
+    after = line.seq;
+  });
+  while (box.children.length > %d) box.removeChild(box.firstChild);
+  if (data.lines.length && document.getElementById("follow").checked) window.scrollTo(0, document.body.scrollHeight);
+}
+function poll() {
+  fetch("/logs/data?after=" + after).then(function (answer) { return answer.json(); }).then(show).catch(function () {
+    var state = document.getElementById("state");
+    state.textContent = "агент не отвечает";
+    state.className = "bad";
+  }).then(function () { setTimeout(poll, 2000); });
+}
+poll();
+</script></body></html>
+""" % LOG_PAGE_LINES
+
+
 class AgentHttpServer(ThreadingHTTPServer):
     allow_reuse_address = False  # configure_listen_socket() decides per platform.
 
@@ -616,9 +675,14 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
     def end_headers(self) -> None:
         # The production default binds only to 127.0.0.1. CORS is therefore
         # needed for a locally hosted reception frontend, not for LAN access.
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        # Logs hold card numbers: no other site may read them.
+        if not self._is_log_path():
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
         super().end_headers()
+
+    def _is_log_path(self) -> bool:
+        return urlsplit(self.path).path in ("/logs", "/logs/data")
 
     def do_OPTIONS(self) -> None:  # noqa: N802
         self.send_response(HTTPStatus.NO_CONTENT)
@@ -627,6 +691,9 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/healthz":
             self._json_response(HTTPStatus.OK, {"status": "ok", "device": self.server.device_status.snapshot()})
+            return
+        if self._is_log_path():
+            self._serve_logs()
             return
         if self.path != "/events":
             self.send_error(HTTPStatus.NOT_FOUND)
@@ -654,6 +721,30 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             pass
         finally:
             self.server.hub.unsubscribe(client)
+
+    def _serve_logs(self) -> None:
+        # Against DNS rebinding: a foreign name pointing at 127.0.0.1 gets nothing.
+        host = urlsplit("//" + self.headers.get("Host", "")).hostname or ""
+        if host not in LOG_PAGE_HOSTS:
+            self.send_error(HTTPStatus.FORBIDDEN)
+            return
+        url = urlsplit(self.path)
+        if url.path == "/logs":
+            body = LOG_PAGE.encode()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        try:
+            after = int(parse_qs(url.query).get("after", ["0"])[0])
+        except ValueError:
+            after = 0
+        self._json_response(
+            HTTPStatus.OK, {"lines": LOG_BUFFER.after(after), "device": self.server.device_status.snapshot()}
+        )
 
     def _json_response(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
         body = json.dumps(payload).encode()
@@ -698,6 +789,8 @@ def configure_logging(app_dir: Optional[str] = None, level: Optional[str] = None
                 log_file, maxBytes=LOG_FILE_MAX_BYTES, backupCount=LOG_FILE_BACKUPS, encoding="utf-8"
             )
         )
+        _load_log_tail(log_file)
+    handlers.append(LOG_BUFFER)
     if sys.stdout is None:
         sys.stdout = open(os.devnull, "w")
     if sys.stderr is None:
@@ -709,6 +802,16 @@ def configure_logging(app_dir: Optional[str] = None, level: Optional[str] = None
         force=True,
     )
     return log_file or None
+
+
+def _load_log_tail(log_file: str) -> None:
+    """Show on /logs what happened before this start: a crash is why someone opens the page."""
+    try:
+        with open(log_file, encoding="utf-8", errors="replace") as previous:
+            for line in collections.deque(previous, maxlen=LOG_PAGE_LINES):
+                LOG_BUFFER.add(line.rstrip("\n"))
+    except OSError:
+        pass
 
 
 def main() -> int:

@@ -1,14 +1,27 @@
+import http.client
+import json
 import logging
 import threading
 import time
 import unittest
-from struct import pack
 
-from app import CARD_REPEAT_SECONDS, EF_ATTLOG, EF_HIDNUM, EVENT_MASK, LOG, DeviceStatus, Settings, ZkLiveCaptureSource
+from app import (
+    CARD_REPEAT_SECONDS,
+    EF_HIDNUM,
+    EVENT_MASK,
+    LOG,
+    LOG_BUFFER,
+    AgentHttpServer,
+    DeviceStatus,
+    EventHub,
+    LogBuffer,
+    Settings,
+    ZkLiveCaptureSource,
+)
 from fake_ma300 import FakeMA300
 from test_watchdog import RecordingHandler, wait_until
 
-CARD = 7654321
+CARD = "7654321"
 
 
 class CardEventsTest(unittest.TestCase):
@@ -16,7 +29,6 @@ class CardEventsTest(unittest.TestCase):
 
     def setUp(self) -> None:
         self.device = FakeMA300()
-        self.device.cards = {"2265": CARD, "31": 0}
         self.log = RecordingHandler()
         self.previous_level = LOG.level
         LOG.setLevel(logging.DEBUG)
@@ -32,6 +44,7 @@ class CardEventsTest(unittest.TestCase):
             self.thread.join(timeout=10)
         LOG.removeHandler(self.log)
         LOG.setLevel(self.previous_level)
+        self.assertEqual(self.device.user_table_requests, 0, "the agent must not depend on the user table")
         self.device.close()
 
     def start(self) -> None:
@@ -57,7 +70,6 @@ class CardEventsTest(unittest.TestCase):
         self.thread = threading.Thread(target=run, daemon=True)
         self.thread.start()
         self.assertTrue(wait_until(lambda: self.device.registered_masks))
-        self.assertTrue(wait_until(lambda: self.device.client is not None))
         time.sleep(0.2)
 
     def cards(self):
@@ -67,53 +79,105 @@ class CardEventsTest(unittest.TestCase):
         self.start()
         self.assertEqual(self.device.registered_masks, [EVENT_MASK])
 
-    def test_a_refused_mask_falls_back_to_attendance_only(self) -> None:
+    def test_a_refused_mask_falls_back_to_cards_only(self) -> None:
         self.device.refuse_wide_mask = True
         self.start()
-        self.assertTrue(wait_until(lambda: self.device.registered_masks[-1:] == [EF_ATTLOG]))
-        self.device.push_event("2265")
-        self.assertTrue(wait_until(lambda: self.cards() == [str(CARD)]))
+        self.assertTrue(wait_until(lambda: self.device.registered_masks[-1:] == [EF_HIDNUM]))
+        self.device.push_event(CARD)
+        self.assertTrue(wait_until(lambda: self.cards() == [CARD]))
 
-    def test_an_unknown_card_reaches_the_stream(self) -> None:
+    def test_a_card_reaches_the_stream_by_its_number(self) -> None:
         self.start()
-        self.device.push_raw_event(EF_HIDNUM, pack("<I", 998877))
-        self.assertTrue(wait_until(lambda: self.cards() == ["998877"]))
+        self.device.push_event(CARD)
+        self.assertTrue(wait_until(lambda: self.cards() == [CARD]))
 
-    def test_an_enrolled_user_is_reported_by_the_card_not_by_the_terminal_id(self) -> None:
+    def test_an_attendance_is_not_a_card_read_and_is_logged(self) -> None:
         self.start()
-        self.device.push_event("2265")
-        self.assertTrue(wait_until(lambda: self.cards() == [str(CARD)]))
+        self.device.push_attendance("2265")
+        self.assertTrue(wait_until(lambda: any("terminal user 2265" in m for m in self.log.messages(logging.INFO))))
+        self.assertEqual(self.cards(), [])
 
-    def test_one_touch_reported_twice_is_one_event(self) -> None:
+    def test_a_card_held_at_the_terminal_is_one_event(self) -> None:
         self.start()
-        self.device.push_raw_event(EF_HIDNUM, pack("<I", CARD))
-        self.device.push_event("2265")
-        self.assertTrue(wait_until(lambda: self.cards() == [str(CARD)]))
+        self.device.push_event(CARD)
+        self.device.push_event(CARD)
+        self.assertTrue(wait_until(lambda: self.cards() == [CARD]))
         time.sleep(0.3)
-        self.assertEqual(self.cards(), [str(CARD)])
+        self.assertEqual(self.cards(), [CARD])
 
     def test_the_same_card_later_is_a_new_event(self) -> None:
         self.start()
-        self.device.push_event("2265")
+        self.device.push_event(CARD)
         self.assertTrue(wait_until(lambda: len(self.cards()) == 1))
         time.sleep(CARD_REPEAT_SECONDS + 0.1)
-        self.device.push_event("2265")
+        self.device.push_event(CARD)
         self.assertTrue(wait_until(lambda: len(self.cards()) == 2))
 
-    def test_a_user_without_a_card_gives_no_event(self) -> None:
+    def test_another_card_right_away_is_a_new_event(self) -> None:
         self.start()
-        self.device.push_event("31")
-        self.assertTrue(wait_until(lambda: any("31 has no card" in m for m in self.log.messages(logging.WARNING))))
-        self.assertEqual(self.cards(), [])
-
-    def test_a_user_enrolled_after_connecting_is_found(self) -> None:
-        self.start()
-        self.device.cards["40"] = 111222
-        self.device.push_event("40")
-        self.assertTrue(wait_until(lambda: self.cards() == ["111222"]))
+        self.device.push_event(CARD)
+        self.device.push_event("111222")
+        self.assertTrue(wait_until(lambda: self.cards() == [CARD, "111222"]))
 
     def test_other_events_are_logged_for_diagnostics_and_give_no_read(self) -> None:
         self.start()
         self.device.push_raw_event(512, bytes.fromhex("3a000000"))
         self.assertTrue(wait_until(lambda: "MA300 event code=512 data=3a000000" in self.log.messages(logging.INFO)))
         self.assertEqual(self.cards(), [])
+
+
+class LogPageTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server = AgentHttpServer(("127.0.0.1", 0), EventHub(), DeviceStatus())
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.port = self.server.server_address[1]
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+    def get(self, path: str, host: str = "127.0.0.1"):
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            connection.putrequest("GET", path, skip_host=True)
+            connection.putheader("Host", host)
+            connection.endheaders()
+            response = connection.getresponse()
+            return response, response.read()
+        finally:
+            connection.close()
+
+    def test_the_page_opens_and_no_other_site_may_read_it(self) -> None:
+        response, body = self.get("/logs")
+        self.assertEqual(response.status, 200)
+        self.assertIn("text/html", response.getheader("Content-Type"))
+        self.assertIn("Логи MA300", body.decode())
+        self.assertIsNone(response.getheader("Access-Control-Allow-Origin"))
+
+    def test_data_returns_only_new_lines_and_the_device_state(self) -> None:
+        LOG_BUFFER.add("first line")
+        _, body = self.get("/logs/data?after=0")
+        data = json.loads(body)
+        self.assertEqual(data["device"]["state"], "starting")
+        self.assertEqual(data["lines"][-1]["text"], "first line")
+        LOG_BUFFER.add("second line")
+        response, body = self.get(f"/logs/data?after={data['lines'][-1]['seq']}")
+        self.assertEqual([line["text"] for line in json.loads(body)["lines"]], ["second line"])
+        self.assertIsNone(response.getheader("Access-Control-Allow-Origin"))
+
+    def test_a_foreign_host_name_gets_nothing(self) -> None:
+        for path in ("/logs", "/logs/data"):
+            response, _ = self.get(path, host="evil.example:8765")
+            self.assertEqual(response.status, 403)
+
+    def test_localhost_with_a_port_is_allowed(self) -> None:
+        response, _ = self.get("/logs", host=f"localhost:{self.port}")
+        self.assertEqual(response.status, 200)
+
+
+class LogBufferTest(unittest.TestCase):
+    def test_keeps_only_the_last_lines(self) -> None:
+        buffer = LogBuffer(capacity=2)
+        for line in ("a", "b", "c"):
+            buffer.add(line)
+        self.assertEqual([line["text"] for line in buffer.after(0)], ["b", "c"])
