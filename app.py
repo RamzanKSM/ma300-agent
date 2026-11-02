@@ -45,6 +45,12 @@ WSAEADDRINUSE = 10048
 CMD_GET_TIME = 201
 CMD_REG_EVENT = 500
 CMD_ACK_UNAUTH = 2005
+# In a CMD_REG_EVENT packet the session id field carries the event code.
+EF_ATTLOG = 1
+EF_FPFTR = 256  # fingerprint minutiae: bulky and of no use here
+EF_HIDNUM = 4096  # zkemkeeper's OnHIDNum mask: a card was presented, enrolled or not. Not yet seen on a real MA300.
+EVENT_MASK = 0xFFFF & ~EF_FPFTR
+CARD_REPEAT_SECONDS = 3.0
 USHRT_MAX = 65535
 
 
@@ -332,6 +338,9 @@ class ZkLiveCaptureSource:
         self._settings = settings
         self.status = status or DeviceStatus()
         self._monotonic = monotonic
+        self._cards: dict[str, str] = {}
+        self._last_card: Optional[tuple[str, float]] = None
+        self._pending: List[Any] = []
 
     def events(self, stopped: threading.Event) -> Iterator[DeviceAttendanceEvent]:
         timeout = self._settings.device_timeout_seconds
@@ -350,18 +359,20 @@ class ZkLiveCaptureSource:
                     self._settings.device_host,
                     self._settings.device_port,
                 )
-                capture = connection.live_capture(new_timeout=timeout)
+                self._read_cards(connection)
+                capture = self._capture(connection, timeout)
                 last_packet = self._monotonic()
                 try:
-                    for attendance in capture:
+                    for reads in capture:
                         if stopped.is_set():
                             return
-                        if attendance is not None:
+                        if reads is not None:
                             last_packet = self._monotonic()
                             self.status.packet()
-                            event = self._convert(attendance)
-                            if event is not None:
-                                yield event
+                            for read in reads:
+                                event = self._convert(read)
+                                if event is not None:
+                                    yield event
                             continue
 
                         LOG.debug("time out")
@@ -433,7 +444,8 @@ class ZkLiveCaptureSource:
             packet = getattr(connection, "_ZK__data_recv")
             getattr(connection, "_ZK__ack_ok")()
             LOG.debug("MA300 pushed an event during the session check")
-            return parse_reg_event(packet[8:], getattr(connection, "_ZK__decode_timehex"))
+            # The clock reply is still on its way, so no command here: _capture() resolves the card after it.
+            return self._decode_event(connection, unpack("<4H", packet[:8])[2], packet[8:], resolve=False)
         if code == CMD_ACK_UNAUTH:
             raise SessionLost("terminal answered 'unauthorized': it forgot the session")
         # Any other answer still comes from a terminal that serves the session;
@@ -441,8 +453,70 @@ class ZkLiveCaptureSource:
         LOG.debug("MA300 answered the session check with code %s; the session is alive", code)
         return []
 
-    @staticmethod
-    def _convert(attendance: Any) -> Optional[DeviceAttendanceEvent]:
+    def _capture(self, connection: Any, timeout: float) -> Iterator[Optional[List[Any]]]:
+        """Like pyzk live_capture(), which hears only EF_ATTLOG: an unknown card never gets there."""
+        connection.cancel_capture()
+        connection.verify_user()
+        if not connection.is_enabled:
+            connection.enable_device()
+        try:
+            connection.reg_event(EVENT_MASK)
+        except Exception as error:  # some firmware may refuse the wide mask.
+            LOG.warning("MA300 refused the event mask (%s); only enrolled cards will be seen", error)
+            connection.reg_event(EF_ATTLOG)
+        sock = getattr(connection, "_ZK__sock")
+        sock.settimeout(timeout)
+        while True:
+            try:
+                packet = sock.recv(1032)
+            except socket.timeout:
+                yield self._resolve_pending(connection) if self._pending else None
+                continue
+            getattr(connection, "_ZK__ack_ok")()
+            if connection.tcp:
+                packet = packet[8:]
+            command, _checksum, code, _reply = unpack("<4H", packet[:8])
+            yield self._decode_event(connection, code, packet[8:]) if command == CMD_REG_EVENT else self._resolve_pending(connection)
+
+    def _decode_event(self, connection: Any, code: int, data: bytes, resolve: bool = True) -> List[Any]:
+        """The cards behind one CMD_REG_EVENT packet; `user_id` of a read is the card number."""
+        if code == EF_ATTLOG:
+            self._pending.extend(parse_reg_event(data, getattr(connection, "_ZK__decode_timehex")))
+            return self._resolve_pending(connection) if resolve else []
+        # Kept at INFO on purpose: this is the evidence of what the terminal really sends.
+        LOG.info("MA300 event code=%s data=%s", code, data.hex())
+        if code == EF_HIDNUM and len(data) >= 4:
+            number = unpack("<I", data[:4])[0]
+            if number:
+                return [_RegEventAttendance(str(number), None, 0, 0)]
+        return []
+
+    def _resolve_pending(self, connection: Any) -> List[Any]:
+        if any(attendance.user_id not in self._cards for attendance in self._pending):
+            # Enrolled on the terminal after the agent connected.
+            self._read_cards(connection)
+        reads = []
+        for attendance in self._pending:
+            card = self._cards.get(attendance.user_id)
+            if card is None:
+                LOG.warning("MA300 user %s has no card number; event skipped", attendance.user_id)
+                continue
+            reads.append(_RegEventAttendance(card, attendance.timestamp, attendance.status, attendance.punch))
+        self._pending = []
+        return reads
+
+    def _read_cards(self, connection: Any) -> None:
+        self._cards = {str(user.user_id): str(user.card) for user in connection.get_users() if user.card}
+
+    def _convert(self, attendance: Any) -> Optional[DeviceAttendanceEvent]:
+        # One touch of an enrolled card can arrive twice: as the card and as the attendance.
+        now = self._monotonic()
+        card = str(attendance.user_id)
+        last = self._last_card
+        self._last_card = (card, now)
+        if last is not None and last[0] == card and now - last[1] < CARD_REPEAT_SECONDS:
+            LOG.debug("Repeat of card %s ignored", card)
+            return None
         try:
             event = DeviceAttendanceEvent.from_pyzk(attendance)
         except (TypeError, ValueError) as error:

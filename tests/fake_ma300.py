@@ -12,6 +12,8 @@ CMD_GET_FREE_SIZES = 50
 CMD_STARTVERIFY = 60
 CMD_CANCELCAPTURE = 62
 CMD_ATTLOG_RRQ = 13
+CMD_USERTEMP_RRQ = 9
+CMD_DATA = 1501
 CMD_PREPARE_BUFFER = 1503  # pyzk read_with_buffer(): the real command is inside command_string
 CMD_GET_TIME = 201
 CMD_REG_EVENT = 500
@@ -45,6 +47,9 @@ class FakeMA300:
         self.time_reply_code = CMD_ACK_OK  # answer code for CMD_GET_TIME in a live session
         # The journal holds old records, so pyzk get_attendance() really asks for them.
         self.records = 5
+        self.cards = {}  # enrolled users: user_id -> card number (0 — no card)
+        self.refuse_wide_mask = False
+        self.registered_masks = []
         self._stopped = threading.Event()
         self._thread = threading.Thread(target=self._serve, daemon=True)
         self._thread.start()
@@ -68,9 +73,20 @@ class FakeMA300:
             return [item[2] for item in self.commands if item[1] == self.session_id and item[0] != CMD_ACK_OK]
 
     def push_event(self, user_id: str) -> None:
+        self.cards.setdefault(user_id, int(user_id))  # enrolled under its own number unless a test says otherwise
         payload = pack("<24sBB6s", user_id.encode(), 1, 0, bytes([26, 10, 29, 9, 15, 30]))
-        header = pack("<4H", CMD_REG_EVENT, 0, self.session_id, 0)
+        self.push_raw_event(1, payload)
+
+    def push_raw_event(self, code: int, payload: bytes) -> None:
+        header = pack("<4H", CMD_REG_EVENT, 0, code, 0)
         self.sock.sendto(header + payload, self.client)
+
+    def _user_table(self) -> bytes:
+        records = b"".join(
+            pack("<HB5s8sIxBhI", index + 1, 0, b"", b"", card, 1, 0, int(user_id))
+            for index, (user_id, card) in enumerate(self.cards.items())
+        )
+        return pack("<I", len(records)) + records
 
     def _reply(self, code: int, session_id: int, reply_id: int, data: bytes = b"") -> None:
         self.sock.sendto(pack("<4H", code, 0, session_id, reply_id) + data, self.client)
@@ -108,6 +124,7 @@ class FakeMA300:
                     continue
                 if command == CMD_GET_FREE_SIZES:
                     sizes = [0] * 20
+                    sizes[4] = len(self.cards)
                     sizes[8] = self.records
                     self._reply(CMD_ACK_OK, session_id, reply_id, pack("<20i", *sizes) + bytes(12))
                 elif command == CMD_GET_TIME:
@@ -118,7 +135,14 @@ class FakeMA300:
                     if self.event_after_time_reply:
                         self.push_event(self.event_after_time_reply)
                         self.event_after_time_reply = None
-                elif command in (CMD_CANCELCAPTURE, CMD_STARTVERIFY, CMD_ENABLEDEVICE, CMD_REG_EVENT, CMD_EXIT):
+                elif command == CMD_PREPARE_BUFFER and unpack("<h", packet[9:11])[0] == CMD_USERTEMP_RRQ:
+                    self._reply(CMD_DATA, session_id, reply_id, self._user_table())
+                elif command == CMD_REG_EVENT:
+                    mask = unpack("<I", packet[8:12])[0]
+                    self.registered_masks.append(mask)
+                    refused = self.refuse_wide_mask and mask != 1
+                    self._reply(CMD_ACK_ERROR if refused else CMD_ACK_OK, session_id, reply_id)
+                elif command in (CMD_CANCELCAPTURE, CMD_STARTVERIFY, CMD_ENABLEDEVICE, CMD_EXIT):
                     self._reply(CMD_ACK_OK, session_id, reply_id)
                 else:
                     self._reply(CMD_ACK_ERROR, session_id, reply_id)
