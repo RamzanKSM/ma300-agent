@@ -128,7 +128,7 @@ class WatchdogTest(unittest.TestCase):
         self.assertNotIn("time out", infos)
         self.assertEqual(len(infos), 3, infos)  # connected + the raw terminal event + the card event
         self.assertTrue(infos[0].startswith("Connected to MA300"))
-        self.assertTrue(infos[1].startswith("MA300 event code=4096"))
+        self.assertTrue(infos[1].startswith("MA300 event code=1024"))
         self.assertTrue(infos[2].startswith("EVENT: <Attendance>: 2265"))
         self.assertEqual(self.status.snapshot()["state"], "connected")
 

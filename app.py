@@ -50,7 +50,7 @@ CMD_ACK_UNAUTH = 2005
 # In a CMD_REG_EVENT packet the session id field carries the event code.
 EF_ATTLOG = 1
 EF_FPFTR = 256  # fingerprint minutiae: bulky and of no use here
-EF_HIDNUM = 4096  # zkemkeeper's OnHIDNum mask: a card was presented, enrolled or not. Not yet seen on a real MA300.
+EF_CARD = 1024  # a card was presented, enrolled or not; seen on the real MA300, little-endian number in the payload.
 LOG_PAGE_LINES = 2000
 LOG_PAGE_HOSTS = {"127.0.0.1", "localhost", "::1"}
 EVENT_MASK = 0xFFFF & ~EF_FPFTR
@@ -491,7 +491,7 @@ class ZkLiveCaptureSource:
             connection.reg_event(EVENT_MASK)
         except Exception as error:  # some firmware may refuse the wide mask.
             LOG.warning("MA300 refused the event mask %#x (%s); asking for cards only", EVENT_MASK, error)
-            connection.reg_event(EF_HIDNUM)
+            connection.reg_event(EF_CARD)
         sock = getattr(connection, "_ZK__sock")
         sock.settimeout(timeout)
         while True:
@@ -514,7 +514,7 @@ class ZkLiveCaptureSource:
             for attendance in parse_reg_event(data, getattr(connection, "_ZK__decode_timehex")):
                 LOG.info("MA300 attendance of terminal user %s: no card number in it, not a card read", attendance.user_id)
             return []
-        if code == EF_HIDNUM and len(data) >= 4:
+        if code == EF_CARD and len(data) >= 4:
             number = unpack("<I", data[:4])[0]
             if number:
                 return [_RegEventAttendance(str(number), None, 0, 0)]

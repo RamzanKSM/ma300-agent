@@ -7,7 +7,7 @@ import unittest
 
 from app import (
     CARD_REPEAT_SECONDS,
-    EF_HIDNUM,
+    EF_CARD,
     EVENT_MASK,
     LOG,
     LOG_BUFFER,
@@ -82,7 +82,7 @@ class CardEventsTest(unittest.TestCase):
     def test_a_refused_mask_falls_back_to_cards_only(self) -> None:
         self.device.refuse_wide_mask = True
         self.start()
-        self.assertTrue(wait_until(lambda: self.device.registered_masks[-1:] == [EF_HIDNUM]))
+        self.assertTrue(wait_until(lambda: self.device.registered_masks[-1:] == [EF_CARD]))
         self.device.push_event(CARD)
         self.assertTrue(wait_until(lambda: self.cards() == [CARD]))
 
@@ -90,6 +90,17 @@ class CardEventsTest(unittest.TestCase):
         self.start()
         self.device.push_event(CARD)
         self.assertTrue(wait_until(lambda: self.cards() == [CARD]))
+
+    def test_packets_captured_from_the_real_ma300(self) -> None:
+        self.start()
+        self.device.push_raw_event(1024, bytes.fromhex("2498110000"))  # a card the terminal does not know
+        self.device.push_raw_event(128, bytes.fromhex("ffffffffff"))
+        self.device.push_raw_event(512, bytes.fromhex("3a000000"))
+        self.device.push_raw_event(1024, bytes.fromhex("e9297b0000"))  # an enrolled card
+        self.device.push_raw_event(1, bytes.fromhex("c607000002001a0b02142a08"))
+        self.assertTrue(wait_until(lambda: self.cards() == ["1153060", "8071657"]))
+        time.sleep(0.3)
+        self.assertEqual(self.cards(), ["1153060", "8071657"])
 
     def test_an_attendance_is_not_a_card_read_and_is_logged(self) -> None:
         self.start()

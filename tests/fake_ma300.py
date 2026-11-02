@@ -72,7 +72,7 @@ class FakeMA300:
             return [item[2] for item in self.commands if item[1] == self.session_id and item[0] != CMD_ACK_OK]
 
     def push_event(self, card: str) -> None:
-        self.push_raw_event(4096, pack("<I", int(card)))
+        self.push_raw_event(1024, pack("<I", int(card)) + b"\x00")
 
     def push_attendance(self, user_id: str) -> None:
         self.push_raw_event(1, pack("<24sBB6s", user_id.encode(), 1, 0, bytes([26, 10, 29, 9, 15, 30])))
@@ -132,7 +132,7 @@ class FakeMA300:
                 elif command == CMD_REG_EVENT:
                     mask = unpack("<I", packet[8:12])[0]
                     self.registered_masks.append(mask)
-                    refused = self.refuse_wide_mask and mask != 4096
+                    refused = self.refuse_wide_mask and mask != 1024
                     self._reply(CMD_ACK_ERROR if refused else CMD_ACK_OK, session_id, reply_id)
                 elif command in (CMD_CANCELCAPTURE, CMD_STARTVERIFY, CMD_ENABLEDEVICE, CMD_EXIT):
                     self._reply(CMD_ACK_OK, session_id, reply_id)
